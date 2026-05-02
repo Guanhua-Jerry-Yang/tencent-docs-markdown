@@ -133,45 +133,54 @@ content = handle_read('https://docs.qq.com/markdown/DQxxxxxxxx')
 
 覆盖已有文档的内容（支持直接传入文本或 `.md` 文件路径）。
 
+> **⚠️ 安全提示：** 这是**破坏性操作**。交互模式下会显示目标文档标题与 URL 并要求确认 (`y/N`)。程序化调用须显式传入 `confirm=True`，否则操作会被拒绝。CLI 也可加 `-y/--yes` 跳过提示。
+
 **命令行：**
 ```bash
 python -m src.main update https://docs.qq.com/markdown/DQxxxxxxxx "# 新内容"
 python -m src.main update https://docs.qq.com/markdown/DQxxxxxxxx ./updated.md
+python -m src.main update https://docs.qq.com/markdown/DQxxxxxxxx ./updated.md -y   # 跳过确认
 ```
 
 **编程接口：**
 ```python
 from src.main import handle_update
-handle_update('https://docs.qq.com/markdown/DQxxxxxxxx', '# 更新后的内容')
+handle_update('https://docs.qq.com/markdown/DQxxxxxxxx', '# 更新后的内容', confirm=True)
 ```
 
 ### 6. 删除文档
 
 将文档移入回收站。
 
+> **⚠️ 安全提示：** 交互模式下会展示目标文档标题与 URL 并要求确认 (`y/N`)。程序化调用须显式传入 `confirm=True`，否则操作会被拒绝。CLI 也可加 `-y/--yes` 跳过提示。
+
 **命令行：**
 ```bash
 python -m src.main delete https://docs.qq.com/markdown/DQxxxxxxxx
+python -m src.main delete https://docs.qq.com/markdown/DQxxxxxxxx -y        # 跳过确认
 ```
 
 **编程接口：**
 ```python
 from src.main import handle_delete
-result = handle_delete('https://docs.qq.com/markdown/DQxxxxxxxx')
-# result: {'padId': ..., 'deleted': True}
+result = handle_delete('https://docs.qq.com/markdown/DQxxxxxxxx', confirm=True)
+# result: {'padId': ..., 'title': ..., 'deleted': True}
 ```
 
 ### 7. 重命名文档
 
+> **⚠️ 安全提示：** 交互模式下会展示原标题、新标题与 URL 并要求确认 (`y/N`)。程序化调用须显式传入 `confirm=True`。
+
 **命令行：**
 ```bash
 python -m src.main rename https://docs.qq.com/markdown/DQxxxxxxxx "新标题"
+python -m src.main rename https://docs.qq.com/markdown/DQxxxxxxxx "新标题" -y  # 跳过确认
 ```
 
 **编程接口：**
 ```python
 from src.main import handle_rename
-handle_rename('https://docs.qq.com/markdown/DQxxxxxxxx', '新标题')
+handle_rename('https://docs.qq.com/markdown/DQxxxxxxxx', '新标题', confirm=True)
 ```
 
 ### 8. 获取文档信息
@@ -195,11 +204,28 @@ python -m src.main login          # 使用缓存的 Cookies（如有效）
 python -m src.main login --force  # 强制重新登录
 ```
 
+### 10. 登出 / 清除 Cookies
+
+删除本地 `.cookies.json` 凭证文件，在不再需要该会话时使用。
+
+**命令行：**
+```bash
+python -m src.main logout
+```
+
+**编程接口：**
+```python
+from src.auth import clear_cookies
+clear_cookies()
+```
+
 ---
 
 ## 认证机制
 
 首次使用需扫码登录，之后 Cookie 会缓存在 `.cookies.json` 中自动复用。
+
+> **🔐 凭证管理：** `.cookies.json` 被明确声明为 **账户级凭证**。保存时会自动应用 POSIX `0600` 权限（仅当前用户可读写），并在终端提示用户其敏感性。**切勿**将此文件提交到版本控制或共享给他人；不再使用时请运行 `python -m src.main logout` 或手动删除。推荐使用专用的自动化账号，而非个人主账号。
 
 支持两种登录方式：
 1. **扫码登录** — 使用微信/QQ 扫描二维码
@@ -287,8 +313,11 @@ tencent-docs-markdown/
 - Markdown 文档类型编号为 `14`（`doc_type=14`）
 - 默认 `domain_id` 为 `300000000`
 - XSRF Token 从 `TOK` Cookie 中提取
-- Cookies 存储在 `.cookies.json` 中（已加入 .gitignore）
-- **安全提示：** `.cookies.json` 包含敏感的会话 Cookie，请勿提交到版本控制或分享给他人，建议限制其文件权限（如 `chmod 600 .cookies.json`）
+- Cookies 存储在 `.cookies.json` 中（已加入 .gitignore），保存时自动设置 `0600` 权限
+- **安全提示：** `.cookies.json` 包含敏感的会话 Cookie，其作用等同于账户凭证。请勿提交到版本控制或分享给他人；文件自动设置 `0600` 权限，如需手动重置：`chmod 600 .cookies.json`。不再使用时请运行 `python -m src.main logout` 清除。
+- **破坏性操作保护：** `update` / `delete` / `rename` 均为不可撤销或影响用户文档的操作；它们在执行前会解析并展示目标文档的标题与 URL，交互模式下要求 `y/N` 确认；程序化调用必须显式传入 `confirm=True`，否则操作会被拒绝。
+- **隐私提示：** `download` / `read` 会将文档内容暴露给当前 agent 会话、终端输出或本地文件；请避免对高敏感文档使用这些操作。
+- **依赖版本锁定：** `requirements.txt` 中所有运行时依赖都被锁定到确定版本以减少供应链风险；请在可信任的环境中安装并审查任何依赖更新。
 - 删除操作会将文档移至回收站（可恢复）
 - 下载/读取/更新操作会自动解析 URL 中的标识符为真实 padId
 - 建议在受控或受信环境中运行此工具，因为 Playwright 会下载 Chromium 并使用浏览器自动化权限
@@ -300,4 +329,4 @@ tencent-docs-markdown/
 
 | 配置项 | 路径 | 说明 |
 |--------|------|------|
-| Cookie 存储 | `.cookies.json`（项目根目录，自动生成） | 存储腾讯文档会话 Cookie，首次登录后自动创建。**此文件包含敏感信息，请勿泄露。** |
+| Cookie 存储（凭证） | `.cookies.json`（项目根目录，自动生成） | 存储腾讯文档会话 Cookie 的**账户级凭证文件**。首次登录后自动创建，保存时自动应用 `0600` 权限。**此文件包含敏感信息，请勿泄露；不再使用时请运行 `python -m src.main logout` 或手动删除。**
