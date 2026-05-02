@@ -34,9 +34,61 @@ USER_AGENT = (
 
 
 def save_cookies(cookies: list) -> None:
-    """Save cookies to local file."""
-    with open(COOKIE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cookies, f, indent=2, ensure_ascii=False)
+    """
+    Save cookies to local file as a sensitive credential.
+
+    SECURITY NOTE — The `.cookies.json` file is treated as a credential
+    store. We enforce restrictive filesystem permissions (0600, owner
+    read/write only) on POSIX systems so that no other local user can
+    read the session cookies. Users are also reminded via CLI output
+    that this file grants full account access and must not be shared.
+    """
+    # Write the file first, then tighten permissions immediately after.
+    # On POSIX we create the file with mode 0600 via os.open() to avoid
+    # any window where the file is world-readable.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    try:
+        # 0o600 = rw-------  (owner read/write only)
+        fd = os.open(COOKIE_FILE, flags, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, indent=2, ensure_ascii=False)
+    except (OSError, AttributeError):
+        # Fallback for platforms where os.open mode is not honored (e.g. Windows).
+        with open(COOKIE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, indent=2, ensure_ascii=False)
+
+    # Best-effort chmod in case the file already existed with looser perms.
+    try:
+        os.chmod(COOKIE_FILE, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+    print(
+        f"\n\U0001f510 Credential notice: session cookies saved to {COOKIE_FILE}\n"
+        "   This file grants full access to your Tencent Docs account.\n"
+        "   • Do NOT commit it to version control or share it with anyone.\n"
+        "   • To sign out, delete the file or run: python -m src.main logout\n"
+    )
+
+
+def clear_cookies() -> bool:
+    """
+    Delete the local cookie file to sign the user out.
+
+    Returns True if a file was deleted, False if no file existed.
+    This gives users a clear, explicit way to remove the stored
+    credential when they no longer need it.
+    """
+    if os.path.exists(COOKIE_FILE):
+        try:
+            os.unlink(COOKIE_FILE)
+            print(f"\U0001f9f9 Cookies cleared: {COOKIE_FILE} removed.")
+            return True
+        except OSError as e:
+            print(f"\u26a0\ufe0f  Failed to remove cookie file: {e}")
+            return False
+    print("\u2139\ufe0f  No stored cookies to clear.")
+    return False
 
 
 def sanitize_cookies(data) -> list | None:
@@ -779,6 +831,14 @@ def login_with_qr_code() -> list:
 
 def ensure_login() -> list:
     """Ensure we have valid cookies. If not, trigger QR code login."""
+    # Defensive: if the credential file already exists but has loose
+    # permissions, tighten them so we never leave a world-readable copy.
+    if os.path.exists(COOKIE_FILE):
+        try:
+            os.chmod(COOKIE_FILE, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+
     cookies = load_cookies()
 
     if cookies and is_cookie_valid(cookies):

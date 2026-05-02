@@ -13,7 +13,7 @@ from pathlib import Path
 
 import click
 
-from .auth import ensure_login, force_re_login
+from .auth import ensure_login, force_re_login, clear_cookies
 from .api import (
     create_document,
     delete_document,
@@ -25,6 +25,42 @@ from .api import (
     resolve_real_pad_id,
     DEFAULT_DOMAIN_ID,
 )
+
+
+# ── Destructive-operation confirmation gate ──────────────────────────
+#
+# The following helpers enforce an explicit, human-readable confirmation
+# before any mutation that could overwrite, rename, or trash a document
+# on the user's Tencent Docs account. This addresses the "Tool Misuse
+# and Exploitation" risk where the agent might be tricked (via a
+# malicious URL or instruction) into destroying the wrong document.
+#
+# Every destructive handler:
+#   1. Resolves the target document and displays its title + URL.
+#   2. Refuses to proceed unless the caller has explicitly opted in
+#      via confirm=True (programmatic) or interactive y/N prompt (CLI).
+
+def _prompt_confirmation(action: str, details: dict) -> bool:
+    """
+    Ask the user to confirm a destructive action on an interactive TTY.
+
+    Non-interactive callers (e.g. automated agents) MUST pass
+    confirm=True explicitly — they never reach this prompt.
+    Returns True only if the user types 'y' or 'yes' (case-insensitive).
+    """
+    print("\n\u26a0\ufe0f  Confirmation required for destructive action:")
+    print(f"   Action: {action}")
+    for k, v in details.items():
+        print(f"   {k}: {v}")
+    if not sys.stdin.isatty():
+        # No human is present — refuse rather than auto-confirm.
+        print("   ❌  Non-interactive session and confirm=False → aborting.")
+        return False
+    try:
+        answer = input("   Proceed? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ('y', 'yes')
 
 
 def handle_create(title: str, content: str | None = None) -> dict:
@@ -100,8 +136,15 @@ def handle_download(doc_url: str, output_path: str | None = None) -> dict:
     Args:
         doc_url: Tencent Docs URL
         output_path: Optional output file path
+
+    Privacy note:
+        The downloaded content is written to the local filesystem and
+        returned to the caller. Only run this on documents you are
+        comfortable exposing to the current agent/session.
     """
     print('📥 Downloading Markdown document...')
+    print('   ℹ\ufe0f  Privacy notice: document contents will be written to disk and')
+    print('       returned to the caller. Avoid using this on highly sensitive docs.')
     try:
         cookies = ensure_login()
 
@@ -111,6 +154,8 @@ def handle_download(doc_url: str, output_path: str | None = None) -> dict:
         global_pad_id = doc_meta['globalPadId']
         doc_title = doc_meta.get('title', '')
         pad_id = doc_meta['padId']
+
+        print(f"   📄 Target: \"{doc_title or '(untitled)'}\"  ←  {doc_url}")
 
         # Read content
         print('   Reading document content...')
@@ -140,14 +185,21 @@ def handle_download(doc_url: str, output_path: str | None = None) -> dict:
         raise
 
 
-def handle_delete(doc_url: str) -> dict:
+def handle_delete(doc_url: str, confirm: bool = False) -> dict:
     """
-    Delete a Tencent Docs Markdown document.
+    Delete a Tencent Docs Markdown document (move to trash).
 
     Args:
         doc_url: Tencent Docs URL
+        confirm: MUST be True for programmatic callers. If False and the
+                 session is interactive, the user will be prompted to
+                 confirm. Otherwise the operation is refused.
+
+    Safety:
+        Displays the resolved title + URL before performing the delete
+        so the user can verify the correct document is being trashed.
     """
-    print('🗑️  Deleting Markdown document...')
+    print('🗑\ufe0f  Deleting Markdown document...')
     try:
         cookies = ensure_login()
 
@@ -155,18 +207,28 @@ def handle_delete(doc_url: str) -> dict:
         print('   Resolving document ID...')
         doc_meta = resolve_real_pad_id(cookies, doc_url)
         pad_id = doc_meta['padId']
+        doc_title = doc_meta.get('title', '') or '(untitled)'
 
         if not pad_id:
             raise RuntimeError(f'Cannot resolve real pad ID from URL: {doc_url}')
 
+        # Safety gate: require explicit confirmation before trashing.
+        if not confirm:
+            ok = _prompt_confirmation(
+                action='DELETE (move to trash)',
+                details={'Title': doc_title, 'URL': doc_url, 'Pad ID': pad_id},
+            )
+            if not ok:
+                print('❌ Delete aborted by user / non-interactive caller.')
+                return {'padId': pad_id, 'deleted': False, 'aborted': True}
+
         delete_document(cookies, pad_id)
 
-        print(f"✅ Document deleted (moved to trash): {pad_id}")
-        return {'padId': pad_id, 'deleted': True}
+        print(f"✅ Document deleted (moved to trash): \"{doc_title}\"  [{pad_id}]")
+        return {'padId': pad_id, 'title': doc_title, 'deleted': True}
     except Exception as err:
         print(f"❌ Delete failed: {err}")
         raise
-
 
 def handle_read(doc_url: str) -> str:
     """
@@ -174,8 +236,15 @@ def handle_read(doc_url: str) -> str:
 
     Args:
         doc_url: Tencent Docs URL
+
+    Privacy note:
+        The returned content may flow into agent conversation logs,
+        terminal output, or downstream tool calls. Avoid using this
+        on highly sensitive documents.
     """
     print('📖 Reading Markdown document...')
+    print('   ℹ\ufe0f  Privacy notice: document content will be exposed to the caller /')
+    print('       agent session. Avoid using this on highly sensitive docs.')
     try:
         cookies = ensure_login()
 
@@ -183,6 +252,9 @@ def handle_read(doc_url: str) -> str:
         print('   Resolving document ID...')
         doc_meta = resolve_real_pad_id(cookies, doc_url)
         global_pad_id = doc_meta['globalPadId']
+        doc_title = doc_meta.get('title', '') or '(untitled)'
+
+        print(f"   📄 Target: \"{doc_title}\"  ←  {doc_url}")
 
         content = read_document(cookies, global_pad_id)
 
@@ -197,13 +269,21 @@ def handle_read(doc_url: str) -> str:
         raise
 
 
-def handle_update(doc_url: str, content_or_path: str) -> dict:
+def handle_update(doc_url: str, content_or_path: str, confirm: bool = False) -> dict:
     """
-    Update document content from a local file or text.
+    Update (OVERWRITE) document content from a local file or text.
 
     Args:
         doc_url: Tencent Docs URL
         content_or_path: Markdown content or path to .md file
+        confirm: MUST be True for programmatic callers. If False and the
+                 session is interactive, the user will be prompted to
+                 confirm. Otherwise the operation is refused.
+
+    Safety:
+        This is a DESTRUCTIVE operation — the existing content is
+        replaced entirely. Displays resolved title + URL + a preview of
+        the new content so the user can verify the target.
     """
     print('📝 Updating Markdown document...')
     try:
@@ -214,52 +294,99 @@ def handle_update(doc_url: str, content_or_path: str) -> dict:
         doc_meta = resolve_real_pad_id(cookies, doc_url)
         global_pad_id = doc_meta['globalPadId']
         pad_id = doc_meta['padId']
+        doc_title = doc_meta.get('title', '') or '(untitled)'
 
         # Determine if content_or_path is a file path or direct content
         content = content_or_path
+        source_hint = 'inline text'
         resolved_path = str(Path(content_or_path).resolve())
         if os.path.exists(resolved_path) and resolved_path.endswith('.md'):
             with open(resolved_path, 'r', encoding='utf-8') as f:
                 content = f.read()
+            source_hint = f'file: {resolved_path}'
             print(f"   Updating from file: {resolved_path}")
+
+        # Safety gate: require explicit confirmation before overwriting.
+        if not confirm:
+            preview = (content[:120] + '…') if len(content) > 120 else content
+            preview = preview.replace('\n', ' ↵ ')
+            ok = _prompt_confirmation(
+                action='UPDATE (overwrite existing content)',
+                details={
+                    'Title': doc_title,
+                    'URL': doc_url,
+                    'Pad ID': pad_id,
+                    'New content source': source_hint,
+                    'New content size': f'{len(content)} chars',
+                    'Preview': preview,
+                },
+            )
+            if not ok:
+                print('❌ Update aborted by user / non-interactive caller.')
+                return {'padId': pad_id, 'updated': False, 'aborted': True}
 
         write_document(cookies, global_pad_id, content)
 
-        print('✅ Document updated successfully.')
-        return {'padId': pad_id, 'updated': True}
+        print(f"✅ Document updated successfully: \"{doc_title}\"  [{pad_id}]")
+        return {'padId': pad_id, 'title': doc_title, 'updated': True}
     except Exception as err:
         print(f"❌ Update failed: {err}")
         raise
 
 
-def handle_rename(doc_url: str, new_title: str) -> dict:
+def handle_rename(doc_url: str, new_title: str, confirm: bool = False) -> dict:
     """
     Rename a document.
 
     Args:
         doc_url: Tencent Docs URL
         new_title: New title
+        confirm: MUST be True for programmatic callers. If False and the
+                 session is interactive, the user will be prompted to
+                 confirm. Otherwise the operation is refused.
+
+    Safety:
+        Displays both the old title and the proposed new title before
+        performing the rename, so the user can verify the target.
     """
-    print('✏️  Renaming document...')
+    print('✏\ufe0f  Renaming document...')
     try:
+        if not new_title or not new_title.strip():
+            raise ValueError('New title must be a non-empty string')
+
         cookies = ensure_login()
 
         # Resolve the real padId from the document page
         print('   Resolving document ID...')
         doc_meta = resolve_real_pad_id(cookies, doc_url)
         pad_id = doc_meta['padId']
+        old_title = doc_meta.get('title', '') or '(untitled)'
 
         if not pad_id:
             raise RuntimeError(f'Cannot resolve real pad ID from URL: {doc_url}')
 
+        # Safety gate: require explicit confirmation before renaming.
+        if not confirm:
+            ok = _prompt_confirmation(
+                action='RENAME',
+                details={
+                    'Current title': old_title,
+                    'New title': new_title,
+                    'URL': doc_url,
+                    'Pad ID': pad_id,
+                },
+            )
+            if not ok:
+                print('❌ Rename aborted by user / non-interactive caller.')
+                return {'padId': pad_id, 'renamed': False, 'aborted': True}
+
         result = rename_document(cookies, pad_id, new_title)
 
-        print(f"✅ Document renamed to: {new_title}")
-        return {'padId': pad_id, 'newTitle': new_title, 'raw': result}
+        print(f"✅ Document renamed: \"{old_title}\" → \"{new_title}\"")
+        return {'padId': pad_id, 'oldTitle': old_title, 'newTitle': new_title, 'raw': result}
     except Exception as err:
         print(f"❌ Rename failed: {err}")
         raise
-
 
 def handle_info(doc_url: str) -> dict:
     """
@@ -310,6 +437,17 @@ def login(force):
 
 
 @cli.command()
+def logout():
+    """Clear the locally stored session cookies.
+
+    Removes the `.cookies.json` credential file so the session can no
+    longer be used. Run this when you're done using the skill or before
+    handing the machine to another user.
+    """
+    clear_cookies()
+
+
+@cli.command()
 @click.argument('title')
 @click.option('-c', '--content', default=None, help='Initial Markdown content')
 def create(title, content):
@@ -335,9 +473,11 @@ def download(url, output):
 
 @cli.command()
 @click.argument('url')
-def delete(url):
-    """Delete a Tencent Docs Markdown document."""
-    handle_delete(url)
+@click.option('--yes', '-y', 'yes', is_flag=True, default=False,
+              help='Skip the interactive confirmation prompt (dangerous).')
+def delete(url, yes):
+    """Delete a Tencent Docs Markdown document (move to trash)."""
+    handle_delete(url, confirm=yes)
 
 
 @cli.command()
@@ -350,17 +490,21 @@ def read(url):
 @cli.command()
 @click.argument('url')
 @click.argument('content')
-def update(url, content):
+@click.option('--yes', '-y', 'yes', is_flag=True, default=False,
+              help='Skip the interactive confirmation prompt (dangerous).')
+def update(url, content, yes):
     """Update document content (text or .md file path)."""
-    handle_update(url, content)
+    handle_update(url, content, confirm=yes)
 
 
 @cli.command()
 @click.argument('url')
 @click.argument('title')
-def rename(url, title):
+@click.option('--yes', '-y', 'yes', is_flag=True, default=False,
+              help='Skip the interactive confirmation prompt (dangerous).')
+def rename(url, title, yes):
     """Rename a document."""
-    handle_rename(url, title)
+    handle_rename(url, title, confirm=yes)
 
 
 @cli.command()
